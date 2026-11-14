@@ -36,13 +36,19 @@ enum micro_pad_layers {
 #define MP_PROF_3    0x7E42
 #define MP_PROF_4    0x7E43
 
-/* RP2040 EEPROM layout for 4-profile storage & RGB config (above VIA dynamic keymap region) */
+/* RP2040 EEPROM layout for 4-profile storage & RGB config (above VIA dynamic keymap region 0..1023) */
 #define MP_EEPROM_MAGIC_ADDR 1024
 #define MP_EEPROM_MAGIC_VAL  0x4D50 /* "MP" */
-#define MP_EEPROM_STATE_ADDR 1026   /* 1B active_profile, 1B rgb_enabled, 12B layer RGB (4x3) */
+/* 1026..1047: 1B active_profile, 1B rgb_enabled, 12B layer RGB (4x3), 4B layer mode, 4B layer speed */
+#define MP_EEPROM_STATE_ADDR 1026
 #define MP_EEPROM_PROFILES_BASE 1056
 /* Each profile stores 4 layers * (12 matrix positions + 2 encoder directions) * 2 bytes = 112 bytes */
 #define MP_PROFILE_STRIDE 112
+
+#define MP_LED_MODE_OFF     0
+#define MP_LED_MODE_SOLID   1
+#define MP_LED_MODE_RAINBOW 2
+#define MP_LED_MODE_BREATH  3
 
 static uint8_t mp_active_profile = 0;
 static uint8_t mp_rgb_enabled = 1;
@@ -53,6 +59,22 @@ static uint8_t mp_layer_rgb[MP_MAX_LAYERS][3] = {
     { 245, 158, 11 }, /* NUMPAD: Amber */
     { 225, 29, 72 }   /* FN: Crimson Red */
 };
+static uint8_t mp_layer_mode[MP_MAX_LAYERS] = {
+    MP_LED_MODE_SOLID,
+    MP_LED_MODE_SOLID,
+    MP_LED_MODE_SOLID,
+    MP_LED_MODE_SOLID
+};
+static uint8_t mp_layer_speed[MP_MAX_LAYERS] = { 50, 50, 50, 50 };
+
+static uint8_t mp_pulse_active = 0;
+static uint32_t mp_pulse_start = 0;
+static uint8_t mp_has_drawn_rgb = 0;
+static uint8_t mp_last_out_r = 0;
+static uint8_t mp_last_out_g = 0;
+static uint8_t mp_last_out_b = 0;
+static uint32_t mp_last_anim_tick = 0;
+static uint8_t mp_anim_phase = 0;
 
 /* Dynamic EEPROM Layers (Configurable live via VIA / Desktop App) */
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
@@ -91,13 +113,84 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][NUM_DIRECTIONS] = {
 };
 #endif
 
-static void mp_apply_layer_rgb(uint8_t layer) {
-    if (!mp_rgb_enabled) {
-        rgblight_setrgb_at(0, 0, 0, 0);
+static void mp_set_ws2812_if_changed(uint8_t r, uint8_t g, uint8_t b) {
+    if (!mp_has_drawn_rgb || r != mp_last_out_r || g != mp_last_out_g || b != mp_last_out_b) {
+        mp_last_out_r = r;
+        mp_last_out_g = g;
+        mp_last_out_b = b;
+        mp_has_drawn_rgb = 1;
+        rgblight_setrgb_at(r, g, b, 0);
+    }
+}
+
+static void mp_wheel_rgb(uint8_t hue, uint8_t val, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    uint8_t region = hue / 43;
+    uint8_t rem = (uint8_t)((hue - (region * 43)) * 6);
+    uint8_t p = 0;
+    uint8_t q = (uint8_t)(((uint16_t)val * (255 - rem)) >> 8);
+    uint8_t t = (uint8_t)(((uint16_t)val * rem) >> 8);
+    switch (region) {
+        case 0:  *out_r = val; *out_g = t;   *out_b = p;   break;
+        case 1:  *out_r = q;   *out_g = val; *out_b = p;   break;
+        case 2:  *out_r = p;   *out_g = val; *out_b = t;   break;
+        case 3:  *out_r = p;   *out_g = q;   *out_b = val; break;
+        case 4:  *out_r = t;   *out_g = p;   *out_b = val; break;
+        default: *out_r = val; *out_g = p;   *out_b = q;   break;
+    }
+}
+
+static void mp_render_layer_rgb(uint8_t layer) {
+    if (mp_pulse_active) {
+        if (timer_elapsed32(mp_pulse_start) < 60) {
+            if (mp_rgb_enabled) {
+                mp_set_ws2812_if_changed(255, 255, 255);
+                return;
+            }
+        } else {
+            mp_pulse_active = 0;
+        }
+    }
+
+    uint8_t idx = (layer < MP_MAX_LAYERS) ? layer : 0;
+    uint8_t mode = mp_layer_mode[idx];
+    if (!mp_rgb_enabled || mode == MP_LED_MODE_OFF) {
+        mp_set_ws2812_if_changed(0, 0, 0);
         return;
     }
-    uint8_t idx = (layer < MP_MAX_LAYERS) ? layer : 0;
-    rgblight_setrgb_at(mp_layer_rgb[idx][0], mp_layer_rgb[idx][1], mp_layer_rgb[idx][2], 0);
+
+    uint8_t r = mp_layer_rgb[idx][0];
+    uint8_t g = mp_layer_rgb[idx][1];
+    uint8_t b = mp_layer_rgb[idx][2];
+
+    if (mode == MP_LED_MODE_RAINBOW) {
+        uint8_t max_val = r;
+        if (g > max_val) max_val = g;
+        if (b > max_val) max_val = b;
+        if (max_val == 0) max_val = 255;
+        uint8_t wr = 0, wg = 0, wb = 0;
+        mp_wheel_rgb(mp_anim_phase, max_val, &wr, &wg, &wb);
+        mp_set_ws2812_if_changed(wr, wg, wb);
+        return;
+    }
+
+    if (mode == MP_LED_MODE_BREATH) {
+        uint8_t tri = (mp_anim_phase < 128)
+            ? (uint8_t)(mp_anim_phase * 2)
+            : (uint8_t)((255 - mp_anim_phase) * 2);
+        uint16_t scale = 26 + (((uint16_t)tri * 229) / 255);
+        uint8_t br = (uint8_t)(((uint16_t)r * scale) >> 8);
+        uint8_t bg = (uint8_t)(((uint16_t)g * scale) >> 8);
+        uint8_t bb = (uint8_t)(((uint16_t)b * scale) >> 8);
+        mp_set_ws2812_if_changed(br, bg, bb);
+        return;
+    }
+
+    mp_set_ws2812_if_changed(r, g, b);
+}
+
+static void mp_apply_layer_rgb(uint8_t layer) {
+    mp_has_drawn_rgb = 0;
+    mp_render_layer_rgb(layer);
 }
 
 static void mp_save_profile_to_slot(uint8_t slot) {
@@ -145,6 +238,8 @@ static void mp_persist_state_header(void) {
         eeprom_update_byte((uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 2 + i * 3 + 0), mp_layer_rgb[i][0]);
         eeprom_update_byte((uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 2 + i * 3 + 1), mp_layer_rgb[i][1]);
         eeprom_update_byte((uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 2 + i * 3 + 2), mp_layer_rgb[i][2]);
+        eeprom_update_byte((uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 14 + i), mp_layer_mode[i]);
+        eeprom_update_byte((uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 18 + i), mp_layer_speed[i]);
     }
 }
 
@@ -167,7 +262,14 @@ static void mp_init_eeprom_if_needed(void) {
         mp_layer_rgb[i][0] = eeprom_read_byte((const uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 2 + i * 3 + 0));
         mp_layer_rgb[i][1] = eeprom_read_byte((const uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 2 + i * 3 + 1));
         mp_layer_rgb[i][2] = eeprom_read_byte((const uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 2 + i * 3 + 2));
+        uint8_t saved_mode = eeprom_read_byte((const uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 14 + i));
+        mp_layer_mode[i] = (saved_mode <= MP_LED_MODE_BREATH)
+            ? saved_mode
+            : (mp_rgb_enabled ? MP_LED_MODE_SOLID : MP_LED_MODE_OFF);
+        uint8_t saved_speed = eeprom_read_byte((const uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 18 + i));
+        mp_layer_speed[i] = (saved_speed <= 100) ? saved_speed : 50;
     }
+    mp_load_profile_from_slot(mp_active_profile);
 }
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
@@ -180,13 +282,13 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 mp_load_profile_from_slot(mp_active_profile);
                 eeprom_update_byte((uint8_t *)(uintptr_t)(MP_EEPROM_STATE_ADDR + 0), mp_active_profile);
             }
-            /* Brief white confirmation pulse on GP16 WS2812 LED, then restore active layer color */
+            /* Non-blocking 60ms white confirmation pulse on GP16 WS2812 LED */
             if (mp_rgb_enabled) {
-                rgblight_setrgb_at(255, 255, 255, 0);
-                wait_ms(40);
+                mp_pulse_active = 1;
+                mp_pulse_start = timer_read32();
+                mp_set_ws2812_if_changed(255, 255, 255);
             }
             uint8_t active_layer = get_highest_layer(layer_state);
-            mp_apply_layer_rgb(active_layer);
             uint8_t report[32] = {0};
             report[0] = MP_HID_PREFIX;
             report[1] = MP_EVT_LAYER_STATE;
@@ -235,6 +337,10 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
             data[7 + i * 3 + 0] = mp_layer_rgb[i][0];
             data[7 + i * 3 + 1] = mp_layer_rgb[i][1];
             data[7 + i * 3 + 2] = mp_layer_rgb[i][2];
+            if (length >= 27) {
+                data[19 + i] = mp_layer_mode[i];
+                data[23 + i] = mp_layer_speed[i];
+            }
         }
         raw_hid_send(data, length);
         return true;
@@ -277,6 +383,14 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
             mp_layer_rgb[i][0] = data[4 + i * 3 + 0];
             mp_layer_rgb[i][1] = data[4 + i * 3 + 1];
             mp_layer_rgb[i][2] = data[4 + i * 3 + 2];
+            if (length >= 20 && data[16 + i] <= MP_LED_MODE_BREATH) {
+                mp_layer_mode[i] = data[16 + i];
+            } else {
+                mp_layer_mode[i] = mp_rgb_enabled ? MP_LED_MODE_SOLID : MP_LED_MODE_OFF;
+            }
+            if (length >= 24 && data[20 + i] <= 100) {
+                mp_layer_speed[i] = data[20 + i];
+            }
         }
         mp_apply_layer_rgb(current_layer);
         if (persist) {
@@ -304,8 +418,22 @@ layer_state_t layer_state_set_user(layer_state_t state) {
     return state;
 }
 
+void housekeeping_task_user(void) {
+    if (timer_elapsed32(mp_last_anim_tick) < 20) {
+        return;
+    }
+    mp_last_anim_tick = timer_read32();
+    uint8_t active_layer = get_highest_layer(layer_state);
+    uint8_t idx = (active_layer < MP_MAX_LAYERS) ? active_layer : 0;
+    uint8_t speed = mp_layer_speed[idx];
+    uint8_t step = (uint8_t)(1 + (((uint16_t)speed * 4) / 100));
+    mp_anim_phase = (uint8_t)(mp_anim_phase + step);
+    mp_render_layer_rgb(active_layer);
+}
+
 void keyboard_post_init_user(void) {
     rgblight_enable_noeeprom();
+    mp_last_anim_tick = timer_read32();
     mp_init_eeprom_if_needed();
     mp_apply_layer_rgb(get_highest_layer(layer_state));
 }

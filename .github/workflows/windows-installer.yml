@@ -245,6 +245,9 @@ jobs:
             gh release upload $tag @assets --clobber
           } else {
             gh release create $tag @assets --verify-tag --title "NØDE Grid Macro 1 Studio $tag" --generate-notes
+            if ($LASTEXITCODE -ne 0) {
+              gh release upload $tag @assets --clobber
+            }
           }
           if ($LASTEXITCODE -ne 0) { throw "Could not publish Windows release $tag" }
 

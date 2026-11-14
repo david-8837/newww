@@ -17,9 +17,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   flashFirmware: () => ipcRenderer.invoke('flash-uf2'),
   executeSmartAction: (payload) => ipcRenderer.invoke('execute-smart-action', payload),
   onHardwareSync: (callback) => {
-    ipcRenderer.on('trigger-hardware-sync', () => callback());
+    const listener = () => callback();
+    ipcRenderer.on('trigger-hardware-sync', listener);
+    return () => ipcRenderer.removeListener('trigger-hardware-sync', listener);
   },
   onOpenHardwareModal: (callback) => {
-    ipcRenderer.on('open-hardware-modal', () => callback());
+    const listener = () => callback();
+    ipcRenderer.on('open-hardware-modal', listener);
+    return () => ipcRenderer.removeListener('open-hardware-modal', listener);
   },
 });

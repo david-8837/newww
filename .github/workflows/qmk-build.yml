@@ -2,6 +2,10 @@ name: QMK firmware build
 
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
     paths:
       - 'qmk_firmware/grid_macro_1/**'
       - '.github/workflows/qmk-build.yml'
@@ -12,7 +16,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   # Pin QMK to a reviewed immutable commit rather than its moving default branch.
@@ -135,6 +139,26 @@ jobs:
             echo '- VIA artifact SHA-256 is recorded in `SHA256SUMS.txt`'
           } >> "$GITHUB_STEP_SUMMARY"
         working-directory: ${{ runner.temp }}/qmk_firmware
+
+      - name: Publish firmware to tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          artifact_dir="${RUNNER_TEMP}/grid-macro-1-via-artifact"
+          assets=(
+            "$artifact_dir/grid_macro_1_via.uf2"
+            "$artifact_dir/SHA256SUMS.txt"
+            "$artifact_dir/BUILD-INFO.txt"
+          )
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --verify-tag --title "NØDE Grid Macro 1 Studio $tag" --generate-notes ||
+              gh release upload "$tag" "${assets[@]}" --clobber
+          fi
 
       - name: Upload the VIA UF2 and provenance files
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -32,6 +32,7 @@ class FakeViaDevice extends EventTarget implements HidDeviceLike {
   public readonly keycodes = new Map<string, number>();
   public readonly encoderKeycodes = new Map<string, number>();
   public failNextReport = false;
+  public customDeviceState?: Uint8Array;
 
   public seedKeycode(layer: number, row: number, col: number, keycode: number) {
     this.keycodes.set(`${layer}:${row}:${col}`, keycode);
@@ -85,6 +86,8 @@ class FakeViaDevice extends EventTarget implements HidDeviceLike {
       response[5] = value & 0xff;
     } else if (request[0] === 0x15) {
       this.encoderKeycodes.set(`${request[1]}:${request[3]}`, (request[4] << 8) | request[5]);
+    } else if (request[0] === 0xfd && request[1] === 0x01 && this.customDeviceState) {
+      response.set(this.customDeviceState.subarray(0, response.length));
     }
 
     const event = Object.assign(new Event('inputreport'), {
@@ -438,5 +441,55 @@ describe('QMK/VIA WebHID bridge', () => {
     await expect(bridge.putFile('app_state', state)).resolves.toMatchObject({ ok: true, localOnly: true });
     expect(setItem).toHaveBeenCalledWith('cm2.state.v2', state);
     await expect(bridge.getFile('app_state')).resolves.toMatchObject({ ok: false });
+  });
+
+  it('hydrates 0xFD device layer, profile slot, and per-layer RGB modes on connect and writes RGB modes/speeds', async () => {
+    const hid = new FakeHidApi();
+    const statePacket = new Uint8Array(32);
+    statePacket[0] = 0xfd;
+    statePacket[1] = 0x01;
+    statePacket[2] = 2; // active layer NUMPAD
+    statePacket[3] = 1; // active profile slot 1
+    statePacket[4] = 4; // MP_MAX_LAYERS
+    statePacket[5] = 4; // MP_MAX_PROFILES
+    statePacket[6] = 1; // rgb enabled
+    statePacket.set([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120], 7);
+    statePacket.set([1, 2, 3, 0], 19); // Solid, Rainbow, Breath, Off
+    statePacket.set([40, 75, 25, 50], 23);
+    hid.device.customDeviceState = statePacket;
+
+    const bridge = new QmkViaBridge(hid, { timeoutMs: 20 });
+    const status = await bridge.connect();
+
+    expect(status).toMatchObject({
+      state: 'connected',
+      deviceActiveLayer: 2,
+      activeProfileSlot: 1,
+      rgbConfig: {
+        enabled: true,
+        layerModes: [1, 2, 3, 0],
+        layerSpeeds: [40, 75, 25, 50],
+      },
+    });
+
+    const writeResult = await bridge.request({
+      cmd: 'set_rgb_config',
+      rgbConfig: {
+        enabled: true,
+        persist: true,
+        layerColors: [
+          { r: 0, g: 81, b: 255 },
+          { r: 16, g: 185, b: 129 },
+          { r: 245, g: 158, b: 11 },
+          { r: 225, g: 29, b: 72 },
+        ],
+        layerModes: [2, 3, 1, 0],
+        layerSpeeds: [80, 35, 50, 10],
+      },
+    });
+    expect(writeResult.ok).toBe(true);
+    const rgbPacket = hid.device.reports.find((r) => r[0] === 0xfd && r[1] === 0x04);
+    expect(rgbPacket).toBeDefined();
+    expect(Array.from(rgbPacket!.slice(16, 24))).toEqual([2, 3, 1, 0, 80, 35, 50, 10]);
   });
 });

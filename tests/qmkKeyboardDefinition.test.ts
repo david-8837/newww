@@ -64,4 +64,19 @@ describe('Grid Macro 1 QMK definition preflight', () => {
       expect(keymap).toContain('UG_VALU');
     }
   });
+
+  it('partitions RP2040 emulated EEPROM cleanly between VIA dynamic storage and Micro Pad profiles', () => {
+    expect(config).toMatch(/#define WEAR_LEVELING_LOGICAL_SIZE 4096\b/);
+    expect(config).toMatch(/#define WEAR_LEVELING_BACKING_SIZE \(WEAR_LEVELING_LOGICAL_SIZE \* 2\)/);
+
+    const viaMaxMatch = config.match(/#define DYNAMIC_KEYMAP_EEPROM_MAX_ADDR\s+(\d+)/);
+    const mpMagicMatch = keymaps[1].match(/#define MP_EEPROM_MAGIC_ADDR\s+(\d+)/);
+    expect(viaMaxMatch).not.toBeNull();
+    expect(mpMagicMatch).not.toBeNull();
+    expect(Number(viaMaxMatch![1])).toBeLessThan(Number(mpMagicMatch![1]));
+
+    expect(keymaps[1]).toContain('MP_LED_MODE_RAINBOW');
+    expect(keymaps[1]).toContain('MP_LED_MODE_BREATH');
+    expect(keymaps[1]).toContain('void housekeeping_task_user(void)');
+  });
 });

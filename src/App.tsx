@@ -1253,6 +1253,78 @@ export default function App() {
   const [deviceSyncReady, setDeviceSyncReady] = useState(false);
   const lastSyncedConfigKeyRef = useRef('');
 
+  const hydratedRgbConnectionRef = useRef<boolean>(false);
+
+  const applyConnectedStatus = useCallback((status: QmkViaStatus) => {
+    setDeviceStatus(status);
+    if (typeof status.deviceActiveLayer === 'number') {
+      setDeviceActiveLayer(Math.min(MAX_LAYER_COUNT - 1, Math.max(0, status.deviceActiveLayer)));
+    }
+    if (status.state !== 'connected') {
+      hydratedRgbConnectionRef.current = false;
+      return;
+    }
+    if (status.rgbConfig && !hydratedRgbConnectionRef.current) {
+      hydratedRgbConnectionRef.current = true;
+      const remoteRgb = status.rgbConfig;
+      const modeMap = ['Off', 'Solid', 'Rainbow', 'Breath'] as const;
+      setLayerLedConfigs((prev) =>
+        prev.map((currentCfg, idx) => {
+          const c = remoteRgb.layerColors[idx];
+          const rawMode = remoteRgb.layerModes?.[idx];
+          const preset =
+            rawMode !== undefined && rawMode >= 0 && rawMode <= 3
+              ? modeMap[rawMode]
+              : remoteRgb.enabled
+                ? 'Solid'
+                : 'Off';
+          const rawSpeed = remoteRgb.layerSpeeds?.[idx];
+          const speed =
+            typeof rawSpeed === 'number' && rawSpeed >= 0 && rawSpeed <= 100
+              ? rawSpeed
+              : currentCfg.speed;
+          if (!c) {
+            return { ...currentCfg, preset, speed };
+          }
+          const maxChannel = Math.max(c.r, c.g, c.b);
+          if (maxChannel === 0) {
+            return {
+              ...currentCfg,
+              preset,
+              speed,
+              light: preset === 'Off' ? currentCfg.light : 0,
+            };
+          }
+          const scale = 255 / maxChannel;
+          const nr = Math.min(255, Math.round(c.r * scale));
+          const ng = Math.min(255, Math.round(c.g * scale));
+          const nb = Math.min(255, Math.round(c.b * scale));
+          const colorHex = `#${nr.toString(16).padStart(2, '0')}${ng.toString(16).padStart(2, '0')}${nb.toString(16).padStart(2, '0')}`.toUpperCase();
+          const rNorm = nr / 255;
+          const gNorm = ng / 255;
+          const bNorm = nb / 255;
+          const cMin = Math.min(rNorm, gNorm, bNorm);
+          const delta = 1 - cMin;
+          let hue = currentCfg.hue;
+          if (delta > 0.0001) {
+            if (rNorm === 1) hue = Math.round(((gNorm - bNorm) / delta) * 60);
+            else if (gNorm === 1) hue = Math.round((((bNorm - rNorm) / delta) + 2) * 60);
+            else hue = Math.round((((rNorm - gNorm) / delta) + 4) * 60);
+            if (hue < 0) hue += 360;
+          }
+          return {
+            ...currentCfg,
+            preset,
+            speed,
+            light: Math.round((maxChannel / 255) * 100),
+            hue,
+            colorHex,
+          };
+        }) as [LayerLedConfig, LayerLedConfig, LayerLedConfig, LayerLedConfig]
+      );
+    }
+  }, []);
+
   useEffect(() => {
     const bridge = window.macropad;
     if (!bridge) {
@@ -1263,24 +1335,18 @@ export default function App() {
     let active = true;
     const unsubscribe = bridge.onStatus((status) => {
       if (!active) return;
-      setDeviceStatus(status);
-      if (typeof status.deviceActiveLayer === 'number') {
-        setDeviceActiveLayer(Math.min(MAX_LAYER_COUNT - 1, Math.max(0, status.deviceActiveLayer)));
-      }
+      applyConnectedStatus(status);
     });
     void bridge.getStatus().then((status) => {
       if (!active) return;
-      setDeviceStatus(status);
-      if (typeof status.deviceActiveLayer === 'number') {
-        setDeviceActiveLayer(Math.min(MAX_LAYER_COUNT - 1, Math.max(0, status.deviceActiveLayer)));
-      }
+      applyConnectedStatus(status);
     });
 
     return () => {
       active = false;
       unsubscribe();
     };
-  }, []);
+  }, [applyConnectedStatus]);
 
   useEffect(() => {
     let active = true;
@@ -1436,6 +1502,12 @@ export default function App() {
   ) => {
     const bridge = window.macropad;
     if (!bridge || deviceStatus.state !== 'connected') return;
+    const modeLookup: Record<LayerLedConfig['preset'], number> = {
+      Off: 0,
+      Solid: 1,
+      Rainbow: 2,
+      Breath: 3,
+    };
     const anyEnabled = configs.some((c) => c.preset !== 'Off');
     void bridge
       .request({
@@ -1448,6 +1520,18 @@ export default function App() {
             configs[1].preset === 'Off' ? { r: 0, g: 0, b: 0 } : hexToScaledRgb(configs[1].colorHex, configs[1].light),
             configs[2].preset === 'Off' ? { r: 0, g: 0, b: 0 } : hexToScaledRgb(configs[2].colorHex, configs[2].light),
             configs[3].preset === 'Off' ? { r: 0, g: 0, b: 0 } : hexToScaledRgb(configs[3].colorHex, configs[3].light),
+          ],
+          layerModes: [
+            modeLookup[configs[0].preset],
+            modeLookup[configs[1].preset],
+            modeLookup[configs[2].preset],
+            modeLookup[configs[3].preset],
+          ],
+          layerSpeeds: [
+            configs[0].speed,
+            configs[1].speed,
+            configs[2].speed,
+            configs[3].speed,
           ],
         },
       })
@@ -1569,6 +1653,13 @@ export default function App() {
           layerEvent.activeProfileSlot !== activeProfileIndex
         ) {
           const targetSlot = layerEvent.activeProfileSlot;
+          const targetProfile = profiles[targetSlot];
+          if (targetProfile) {
+            const { config: targetConfig } = buildViaConfiguration(targetProfile, presetOs, {
+              enableHostTriggers: true,
+            });
+            lastSyncedConfigKeyRef.current = `slot:${targetSlot}:${JSON.stringify(targetConfig)}`;
+          }
           setActiveProfileIndex(targetSlot);
           showToast(
             `Switched to ${profiles[targetSlot]?.name || `Profile ${targetSlot + 1}`} from device`
@@ -1603,7 +1694,7 @@ export default function App() {
       unsubscribe();
       triggerController.cancelAll();
     };
-  }, [profiles, activeProfileIndex, currentProfile, deviceActiveLayer]);
+  }, [profiles, activeProfileIndex, currentProfile, deviceActiveLayer, presetOs]);
 
   // Listen for native Electron menu hardware actions when running inside desktop shell
   useEffect(() => {
@@ -4603,6 +4694,8 @@ export default function App() {
                                             return next;
                                           });
                                         }}
+                                        onPointerUp={() => syncRgbConfigsToDevice(layerLedConfigs, true)}
+                                        onKeyUp={() => syncRgbConfigsToDevice(layerLedConfigs, true)}
                                         className="absolute inset-0 w-full opacity-0 cursor-pointer z-10"
                                       />
                                       <div
@@ -4645,9 +4738,12 @@ export default function App() {
                                               ...next[ledEditingLayerIdx],
                                               speed: nextSpeed,
                                             };
+                                            syncRgbConfigsToDevice(next, false);
                                             return next;
                                           });
                                         }}
+                                        onPointerUp={() => syncRgbConfigsToDevice(layerLedConfigs, true)}
+                                        onKeyUp={() => syncRgbConfigsToDevice(layerLedConfigs, true)}
                                         className="absolute inset-0 w-full opacity-0 cursor-pointer z-10"
                                       />
                                       <div
@@ -4702,6 +4798,8 @@ export default function App() {
                                             return next;
                                           });
                                         }}
+                                        onPointerUp={() => syncRgbConfigsToDevice(layerLedConfigs, true)}
+                                        onKeyUp={() => syncRgbConfigsToDevice(layerLedConfigs, true)}
                                         className="absolute inset-0 w-full opacity-0 cursor-pointer z-10"
                                       />
                                       <div
@@ -7783,7 +7881,7 @@ export default function App() {
           </div>
 
           <footer className="pb-[18px] text-[9.5px] text-[#555555] text-center">
-            © 2026 Work Louder Inc.
+            © 2026 NØDE Studio
           </footer>
         </motion.main>
       )}

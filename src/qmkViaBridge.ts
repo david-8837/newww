@@ -72,6 +72,8 @@ export interface DeviceRgbConfig {
   enabled: boolean;
   persist?: boolean;
   layerColors: [LayerRgbColor, LayerRgbColor, LayerRgbColor, LayerRgbColor];
+  layerModes?: [number, number, number, number];
+  layerSpeeds?: [number, number, number, number];
 }
 
 export interface QmkViaStatus {
@@ -581,19 +583,9 @@ export class QmkViaBridge {
     if (request.cmd === 'get_device_state') {
       try {
         const res = await this.exchange(new Uint8Array([MP_HID_PREFIX, MP_CMD_GET_STATE]));
-        const deviceActiveLayer = Math.min(3, Math.max(0, res[2] ?? 0));
-        const activeProfileSlot = Math.min(3, Math.max(0, res[3] ?? 0));
-        const rgbConfig: DeviceRgbConfig = {
-          enabled: (res[6] ?? 1) !== 0,
-          layerColors: [
-            { r: res[7] ?? 0, g: res[8] ?? 81, b: res[9] ?? 255 },
-            { r: res[10] ?? 16, g: res[11] ?? 185, b: res[12] ?? 129 },
-            { r: res[13] ?? 245, g: res[14] ?? 158, b: res[15] ?? 11 },
-            { r: res[16] ?? 225, g: res[17] ?? 29, b: res[18] ?? 72 },
-          ],
-        };
-        this.setStatus({ ...this.status, deviceActiveLayer, activeProfileSlot, rgbConfig });
-        return { ok: true, deviceActiveLayer, activeProfileSlot, rgbConfig };
+        const parsed = this.parseDeviceStateReport(res);
+        this.setStatus({ ...this.status, ...parsed });
+        return { ok: true, ...parsed };
       } catch (error) {
         return { ok: false, error: this.errorMessage(error) };
       }
@@ -646,7 +638,7 @@ export class QmkViaBridge {
         return { ok: false, error: 'Invalid RGB configuration payload' };
       }
       try {
-        const packet = new Uint8Array(16);
+        const packet = new Uint8Array(24);
         packet[0] = MP_HID_PREFIX;
         packet[1] = MP_CMD_SET_RGB;
         packet[2] = cfg.persist ? 1 : 0;
@@ -656,6 +648,14 @@ export class QmkViaBridge {
           packet[4 + i * 3 + 0] = Math.max(0, Math.min(255, Math.round(color.r)));
           packet[4 + i * 3 + 1] = Math.max(0, Math.min(255, Math.round(color.g)));
           packet[4 + i * 3 + 2] = Math.max(0, Math.min(255, Math.round(color.b)));
+          const mode = cfg.layerModes?.[i];
+          packet[16 + i] = Number.isInteger(mode) && mode! >= 0 && mode! <= 3
+            ? mode!
+            : (cfg.enabled ? 1 : 0);
+          const speed = cfg.layerSpeeds?.[i];
+          packet[20 + i] = Number.isFinite(speed)
+            ? Math.max(0, Math.min(100, Math.round(speed!)))
+            : 50;
         }
         await this.exchange(packet);
         this.setStatus({ ...this.status, rgbConfig: cfg });
@@ -858,12 +858,28 @@ export class QmkViaBridge {
         // The protocol version and layer-count handshake are sufficient to connect.
       }
 
+      let initialState: {
+        deviceActiveLayer?: number;
+        activeProfileSlot?: number;
+        rgbConfig?: DeviceRgbConfig;
+      } = {};
+      try {
+        const stateReport = await this.exchange(new Uint8Array([MP_HID_PREFIX, MP_CMD_GET_STATE]));
+        // Only genuine Micro Pad firmware sets MP_MAX_LAYERS (byte 4) and MP_MAX_PROFILES (byte 5).
+        if ((stateReport[4] ?? 0) >= 1 && (stateReport[5] ?? 0) >= 1) {
+          initialState = this.parseDeviceStateReport(stateReport);
+        }
+      } catch {
+        // Stock VIA firmware without the 0xFD extension remains fully supported.
+      }
+
       this.setStatus({
         state: 'connected',
         device: device.productName || 'Grid Macro 1',
         fw: firmware,
         path: `VIA ${this.layerCount} layers`,
         layerCount: this.layerCount,
+        ...initialState,
       });
       this.emit({ type: 'connect', device: device.productName || 'Grid Macro 1' });
     } catch (error) {
@@ -1082,6 +1098,44 @@ export class QmkViaBridge {
 
   private emit(event: unknown): void {
     for (const listener of this.eventListeners) listener(event);
+  }
+
+  private parseDeviceStateReport(res: Uint8Array): {
+    deviceActiveLayer: number;
+    activeProfileSlot: number;
+    rgbConfig: DeviceRgbConfig;
+  } {
+    const deviceActiveLayer = Math.min(3, Math.max(0, res[2] ?? 0));
+    const activeProfileSlot = Math.min(3, Math.max(0, res[3] ?? 0));
+    const enabled = (res[6] ?? 1) !== 0;
+    const defaultMode = enabled ? 1 : 0;
+    const parseMode = (value: number | undefined) =>
+      value !== undefined && value <= 3 ? value : defaultMode;
+    const parseSpeed = (value: number | undefined) =>
+      value !== undefined && value <= 100 ? value : 50;
+
+    const rgbConfig: DeviceRgbConfig = {
+      enabled,
+      layerColors: [
+        { r: res[7] ?? 0, g: res[8] ?? 81, b: res[9] ?? 255 },
+        { r: res[10] ?? 16, g: res[11] ?? 185, b: res[12] ?? 129 },
+        { r: res[13] ?? 245, g: res[14] ?? 158, b: res[15] ?? 11 },
+        { r: res[16] ?? 225, g: res[17] ?? 29, b: res[18] ?? 72 },
+      ],
+      layerModes: [
+        parseMode(res[19]),
+        parseMode(res[20]),
+        parseMode(res[21]),
+        parseMode(res[22]),
+      ],
+      layerSpeeds: [
+        parseSpeed(res[23]),
+        parseSpeed(res[24]),
+        parseSpeed(res[25]),
+        parseSpeed(res[26]),
+      ],
+    };
+    return { deviceActiveLayer, activeProfileSlot, rgbConfig };
   }
 
   private errorMessage(error: unknown): string {

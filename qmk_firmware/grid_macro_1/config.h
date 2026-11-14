@@ -11,8 +11,13 @@
 /* EC11 encoder direction is reversed by the board's wiring. */
 #define ENCODER_DIRECTION_FLIP
 
-/* VIA dynamic keymap is stored in RP2040 flash emulated EEPROM. */
-#define DYNAMIC_KEYMAP_EEPROM_MAX_ADDR 4095
+/* RP2040 wear-leveling emulated EEPROM: 4 KB logical (0..4095) partitioned into:
+ *   0 .. 1023    : QMK / VIA core + dynamic keymap + dynamic macros
+ *   1024 .. 2047 : Micro Pad 4-profile & per-layer RGB persistence
+ */
+#define WEAR_LEVELING_LOGICAL_SIZE 4096
+#define WEAR_LEVELING_BACKING_SIZE (WEAR_LEVELING_LOGICAL_SIZE * 2)
+#define DYNAMIC_KEYMAP_EEPROM_MAX_ADDR 1023
 #define DYNAMIC_KEYMAP_LAYER_COUNT 4
 
 #define TAPPING_TERM 200
