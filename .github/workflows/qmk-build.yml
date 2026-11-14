@@ -153,11 +153,11 @@ jobs:
             "$artifact_dir/SHA256SUMS.txt"
             "$artifact_dir/BUILD-INFO.txt"
           )
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --clobber
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload --repo "$GITHUB_REPOSITORY" "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" "${assets[@]}" --verify-tag --title "NØDE Grid Macro 1 Studio $tag" --generate-notes ||
-              gh release upload "$tag" "${assets[@]}" --clobber
+            gh release create --repo "$GITHUB_REPOSITORY" "$tag" "${assets[@]}" --verify-tag --title "NØDE Grid Macro 1 Studio $tag" --generate-notes ||
+              gh release upload --repo "$GITHUB_REPOSITORY" "$tag" "${assets[@]}" --clobber
           fi
 
       - name: Upload the VIA UF2 and provenance files
